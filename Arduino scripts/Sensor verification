@@ -1,0 +1,96 @@
+// Arduino script which provides communication between sensors to Arduino, and outputs to sensor verification Python script
+#include <Wire.h>
+#include <Adafruit_MCP9600.h>    // Grove thermocouple library
+
+// Pin & address definitions
+#define ANALOG_IN_PIN   A0       // 0,5–4,5 V signaal
+#define FLOW_PIN1       2        // flow-sensor 1 output op D2 (INT0)
+#define FLOW_PIN2       3        // flow-sensor 2 output op D3 (INT1)
+
+// I²C-adresses thermocouple amplifiers
+#define THERMO1_ADDR    0x60
+#define THERMO2_ADDR    0x67
+
+// K-factor flow-sensor
+#define FLOW_K_FACTOR1   1420.0
+#define FLOW_K_FACTOR2   1420.0
+
+// Globals
+Adafruit_MCP9600 thermo1, thermo2;
+volatile uint32_t pulseCount1 = 0;
+volatile uint32_t pulseCount2 = 0;
+
+float totalLiters1 = 0.0;
+float totalLiters2 = 0.0;
+
+// Interupts to increment pulse counts
+void onFlowPulse1() { pulseCount1++; }
+void onFlowPulse2() { pulseCount2++; }
+
+// Setup
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  Serial.println(F(">>> ARDUINO BOOTED <<<"));
+
+  // Analog pin
+  pinMode(ANALOG_IN_PIN, INPUT);
+
+  // Use flow sensors with internal pull-up, add interupt increments
+  pinMode(FLOW_PIN1, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN1), onFlowPulse1, FALLING);
+
+  pinMode(FLOW_PIN2, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN2), onFlowPulse2, FALLING);
+
+  // Thermocouple initialization
+  if (! thermo1.begin(THERMO1_ADDR)) {
+    Serial.println(F("ERROR: Thermo1 not found!"));
+  }
+  if (! thermo2.begin(THERMO2_ADDR)) {
+    Serial.println(F("ERROR: Thermo2 not found!"));
+  }
+
+}
+
+// Main loop
+void loop() {
+  static uint32_t lastCount1 = 0, lastCount2 = 0;
+  static unsigned long lastMillis = millis();
+
+  // Reads analog voltages in the range of 0.5 to 4.5 V
+  int raw = analogRead(ANALOG_IN_PIN);
+  float voltage = raw * (5.0 / 1023.0);
+
+  // Read thermocouple signals
+  float tempC1 = thermo1.readThermocouple();
+  float tempC2 = thermo2.readThermocouple();
+
+  // Calculate flow
+  unsigned long now = millis();
+  if (now - lastMillis >= 1000) {
+    detachInterrupt(digitalPinToInterrupt(FLOW_PIN1));
+    detachInterrupt(digitalPinToInterrupt(FLOW_PIN2));
+      uint32_t delta1 = pulseCount1 - lastCount1;
+      uint32_t delta2 = pulseCount2 - lastCount2;
+      lastCount1 = pulseCount1;
+      lastCount2 = pulseCount2;
+    attachInterrupt(digitalPinToInterrupt(FLOW_PIN1), onFlowPulse1, FALLING);
+    attachInterrupt(digitalPinToInterrupt(FLOW_PIN2), onFlowPulse2, FALLING);
+    lastMillis = now;
+
+    // flow in L/min
+    float flow1 = (delta1 / FLOW_K_FACTOR1) * 60.0;
+    float flow2 = (delta2 / FLOW_K_FACTOR2) * 60.0;
+
+    // Send data to PC via USB connection
+    Serial.print(F("Vin="));   Serial.print(voltage,3);   Serial.print(F(" V, "));
+    Serial.print(F("T1="));    Serial.print(tempC1,2);    Serial.print(F(" °C, "));
+    Serial.print(F("T2="));    Serial.print(tempC2,2);    Serial.print(F(" °C, "));
+    Serial.print(F("Flow1=")); Serial.print(flow1,2);     Serial.print(F(" L/min, "));
+    Serial.print(F("Flow2=")); Serial.println(flow2,2);   Serial.println(F(" L/min"));
+  }
+
+  // Give rest to I2C-bus by delaying shortly
+  delay(10);
+}
