@@ -8,3 +8,6 @@ In this repository are two Python scripts:
 
 # Arduino script
 In this repository there is also the necessary Arduino code, which is needed in conjuction with the Python script for sensor verification
+
+# Updates
+If updates to code are made during continuing work at Axces, code variants will be listed seperately and eventually merged after final defence has taken place
