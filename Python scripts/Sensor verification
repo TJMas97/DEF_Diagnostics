@@ -1,0 +1,322 @@
+"""
+Thijs Masselink, 1570270
+
+Live Sensor Dashboard
+
+Reads sensor data from the serial port and connectivity of the CAN bus, displays it in real time in a Tkinter window,
+and provides the ability to log and plot temperature and EBP data.
+"""
+
+# IMPORTS
+import os
+import threading
+import time
+import csv
+import can
+import matplotlib.pyplot as plt
+import serial
+import tkinter as tk
+from tkinter import ttk, filedialog
+from PIL import Image, ImageTk
+
+# ICONS
+ASSET_PATH = "C:/Users/Thijs/Desktop/"
+LOGO_PATH  = os.path.join(ASSET_PATH, "axces.png")
+ICON_PATH  = os.path.join(ASSET_PATH, "axcespictogram.ico")
+
+# SERIAL CONFIGURATION
+SERIAL_PORT = 'COM9'
+BAUDRATE    = 115200
+
+# J1939 CAN CONFIGURATION
+CAN_CHANNEL    = 'PCAN_USBBUS1'
+CAN_BITRATE    = 500000
+PGN_ENGINE_NOX = 61454 # Inlet NOx
+PGN_TAIL_NOX   = 61455 # Outlet NOX
+CAN_TIMEOUT    = 1.0
+STATUS_THRESH  = 2.0
+
+# EBP CONVERSION PARAMETERS
+EBP_V_MIN  = 0.5
+EBP_V_MAX  = 4.5
+EBP_P_MAX  = 200.0
+EBP_SLOPE  = EBP_P_MAX / (EBP_V_MAX - EBP_V_MIN)
+
+# DATA-LOGGER GLOBALS
+# Temperature
+times                = []
+temps1               = []
+temps2               = []
+logging_temp_active  = False
+
+# Analog EBP
+ebp_times            = []
+ebp_vals             = []
+logging_ebp_active   = False
+
+# SERIAL READER
+def serial_reader(stop_event, on_data):
+    ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
+    time.sleep(2)
+    start_time = time.time()
+
+    while not stop_event.is_set():
+        line = ser.readline().decode(errors='ignore').strip()
+        print("RAW SERIAL:", line)
+        if not line:
+            continue
+        try:
+            parts = [p.strip() for p in line.split(',')]
+            vin  = float(parts[0].split('=')[1].split()[0])
+            t1   = float(parts[1].split('=')[1].split()[0])
+            t2   = float(parts[2].split('=')[1].split()[0])
+            f1   = float(parts[3].split('=')[1].split()[0])
+            f2   = float(parts[4].split('=')[1].split()[0])
+        except Exception:
+            continue
+
+        timestamp = time.time() - start_time
+        on_data(timestamp, vin, t1, t2, f1, f2)
+
+    ser.close()
+
+# GUI CLASS
+class SensorGUI:
+    def __init__(self, root):
+        self.root = root
+        self.configure_root()
+        self.create_widgets()
+        self.start_threads()
+
+    def configure_root(self):
+        self.root.title("Live Sensor Dashboard")
+        if os.path.isfile(ICON_PATH):
+            self.root.iconbitmap(ICON_PATH)
+
+        self.frame = ttk.Frame(self.root, padding=10)
+        self.frame.grid(row=0, column=0, sticky="nsew")
+
+    def create_widgets(self):
+        # Logo
+        if os.path.isfile(LOGO_PATH):
+            pil_img = Image.open(LOGO_PATH)
+            self.logo_img = ImageTk.PhotoImage(pil_img)
+            ttk.Label(self.frame, image=self.logo_img) \
+               .grid(row=0, column=0, columnspan=3, pady=(0,10))
+
+        # Live EBP-display
+        self.labels = {}
+        ebp_lbl = ttk.Label(self.frame, text="EBP: -- mbar (-- V)", font=("Consolas", 14))
+        ebp_lbl.grid(row=1, column=0, pady=3, sticky="w")
+        self.labels["EBP"] = ebp_lbl
+
+        # Serial data
+        rows = [("T1","°C"), ("T2","°C"), ("Flow1","L/min"), ("Flow2","L/min")]
+        for i, (txt, unit) in enumerate(rows, start=2):
+            lbl = ttk.Label(self.frame, text=f"{txt}: -- {unit}", font=("Consolas", 14))
+            lbl.grid(row=i, column=0, pady=3, sticky="w")
+            self.labels[txt] = lbl
+
+        # Cumulative liters
+        self.total_liters1 = 0.0
+        self.total_liters2 = 0.0
+        self.last_time = None
+
+        # Logging Tempature
+        self.log_status_lbl = ttk.Label(self.frame, text="Logging Temp: Off", font=("Consolas", 12))
+        self.log_status_lbl.grid(row=6, column=0, columnspan=2, pady=(10,3), sticky="w")
+        self.temp_btn = ttk.Button(self.frame, text="Start Temp. log", command=self.toggle_temp_logging)
+        self.temp_btn.grid(row=7, column=0, pady=(0,10), sticky="w")
+
+        # Logging EBP
+        self.ebp_status_lbl = ttk.Label(self.frame, text="Logging EBP: Off", font=("Consolas", 12))
+        self.ebp_status_lbl.grid(row=8, column=0, columnspan=2, pady=(0,3), sticky="w")
+        self.ebp_btn = ttk.Button(self.frame, text="Start EBP log", command=self.toggle_ebp_logging)
+        self.ebp_btn.grid(row=9, column=0, pady=(0,10), sticky="w")
+
+        # CAN-status LED’s
+        self.last_can = {"Inlet NOx": 0.0, "Outlet NOx": 0.0}
+        ttk.Label(self.frame, text="Inlet NOx:", font=("Consolas",14)) \
+            .grid(row=10, column=0, sticky="w", pady=(5,0))
+        self.inlet_led = tk.Label(self.frame, text="   ", bg="red")
+        self.inlet_led.grid(row=10, column=1, padx=(5,0), pady=(5,0))
+
+        ttk.Label(self.frame, text="Outlet NOx:", font=("Consolas",14)) \
+            .grid(row=11, column=0, sticky="w", pady=(2,10))
+        self.outlet_led = tk.Label(self.frame, text="   ", bg="red")
+        self.outlet_led.grid(row=11, column=1, padx=(5,0), pady=(2,10))
+
+    # THREADING OF SERIAL AND CAN COMMUNICATION
+    def start_threads(self):
+        # Serial reader
+        self.stop_event = threading.Event()
+        threading.Thread(
+            target=serial_reader,
+            args=(self.stop_event, self.on_serial_data),
+            daemon=True
+        ).start()
+
+        # CAN-listener
+        threading.Thread(target=self.can_listener, daemon=True).start()
+        self.update_can_status()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # BUTTON CALLBACKS
+    def toggle_temp_logging(self):
+        global logging_temp_active
+        logging_temp_active = not logging_temp_active
+        if logging_temp_active:
+            self.temp_btn.config(text="Stop Temp. log")
+            self.log_status_lbl.config(text="Logging Temp: On")
+            times.clear(); temps1.clear(); temps2.clear()
+        else:
+            self.temp_btn.config(text="Start Temp. log")
+            self.log_status_lbl.config(text="Logging Temp: Off")
+            self.export_temp_log()
+            self.plot_temp_data()
+
+    def toggle_ebp_logging(self):
+        global logging_ebp_active
+        logging_ebp_active = not logging_ebp_active
+        if logging_ebp_active:
+            self.ebp_btn.config(text="Stop EBP log")
+            self.ebp_status_lbl.config(text="Logging EBP: On")
+            ebp_times.clear(); ebp_vals.clear()
+        else:
+            self.ebp_btn.config(text="Start EBP log")
+            self.ebp_status_lbl.config(text="Logging EBP: Off")
+            self.export_ebp_log()
+            self.plot_ebp_data()
+
+    # DATA HANDLING
+    def on_serial_data(self, t, vin, t1, t2, f1, f2):
+        # Calculate and show EBP value
+        pressure = max(0.0, min((vin - EBP_V_MIN) * EBP_SLOPE, EBP_P_MAX))
+        self.labels["EBP"].config(text=f"EBP: {pressure:5.1f} mbar ({vin:5.3f} V)")
+
+        # Show temperature values
+        self.labels["T1"].config(text=f"T1:    {t1:5.2f} °C")
+        self.labels["T2"].config(text=f"T2:    {t2:5.2f} °C")
+
+        # Cumulative flow
+        if self.last_time is None:
+            self.last_time = t
+        else:
+            dt = t - self.last_time
+            self.total_liters1 += (f1 / 60.0) * dt
+            self.total_liters2 += (f2 / 60.0) * dt
+            self.last_time = t
+
+        # Show flow with cumulatives 
+        self.labels["Flow1"].config(
+            text=f"Flow1: {f1:5.2f} L/min (Tot: {self.total_liters1:5.3f} L)"
+        )
+        self.labels["Flow2"].config(
+            text=f"Flow2: {f2:5.2f} L/min (Tot: {self.total_liters2:5.3f} L)"
+        )
+
+        # Log data when active
+        if logging_temp_active:
+            times.append(t); temps1.append(t1); temps2.append(t2)
+        if logging_ebp_active:
+            ebp_times.append(t); ebp_vals.append(vin)
+    
+    # Temperature log export
+    def export_temp_log(self):
+        fname = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files","*.csv")],
+            initialfile="temp_log.csv",
+            title="Save temperature log as..."
+        )
+        if fname:
+            with open(fname, mode='w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["time_s", "T1_C", "T2_C"])
+                for t, t1, t2 in zip(times, temps1, temps2):
+                    writer.writerow([f"{t:.3f}", f"{t1:.2f}", f"{t2:.2f}"])
+            print(f"Temperature log saved to {fname}")
+            
+    # EBP log export
+    def export_ebp_log(self):
+        fname = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files","*.csv")],
+            initialfile="ebp_log.csv",
+            title="Save EBP log as..."
+        )
+        if fname:
+            with open(fname, mode='w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["time_s", "Pressure_mbar"]
+                )
+                for t, v in zip(ebp_times, ebp_vals):
+                    pressure = max(0.0, min((v - EBP_V_MIN) * EBP_SLOPE, EBP_P_MAX))
+                    writer.writerow([f"{t:.3f}", f"{pressure:.1f}"])
+            print(f"EBP log saved to {fname}")
+
+ 
+     # PLOTTING OF LOGGED DATA
+    def plot_temp_data(self):
+        plt.figure(figsize=(8,4))
+        plt.plot(times, temps1, label='T1 (°C)')
+        plt.plot(times, temps2, label='T2 (°C)')
+        plt.xlabel("Time (s)")
+        plt.ylabel("Temperature (°C)")
+        plt.title("Temperature data")
+        plt.legend()
+        plt.grid(True)
+        plt.ylim(bottom=-5, top=110)
+        plt.tight_layout()
+        plt.show()
+
+    def plot_ebp_data(self):
+        pressures = [max(0.0, min((v - EBP_V_MIN) * EBP_SLOPE, EBP_P_MAX)) for v in ebp_vals]
+        fig, ax1 = plt.subplots(figsize=(8,4))
+        line1, = ax1.plot(ebp_times, pressures, label='Pressure (mbar)')
+        ax1.set_xlabel("Time (s)")
+        ax1.set_ylabel("Pressure (mbar)")
+        ax1.set_title("Analog input (EBP) - Pressure and voltage")
+        ax1.grid(True)
+
+        ax2 = ax1.twinx()
+        line2, = ax2.plot(ebp_times, ebp_vals, label='Vin (V)')
+        ax2.set_ylabel("Vin (V)")
+
+        ax1.legend(handles=[line1], loc='upper left')
+        ax2.legend(handles=[line2], loc='upper right')
+        fig.tight_layout()
+        plt.show()
+
+    # CAN-BUS FUNCTIONS
+    def can_listener(self):
+        bus = can.interface.Bus(interface='pcan', channel=CAN_CHANNEL, bitrate=CAN_BITRATE)
+        while not self.stop_event.is_set():
+            msg = bus.recv(timeout=CAN_TIMEOUT)
+            if msg is None:
+                continue
+            pgn = (msg.arbitration_id >> 8) & 0xFFFF
+            now = time.time()
+            if pgn == PGN_ENGINE_NOX:
+                self.last_can["Inlet NOx"] = now
+            elif pgn == PGN_TAIL_NOX:
+                self.last_can["Outlet NOx"] = now
+
+    def update_can_status(self):
+        now = time.time()
+        self.inlet_led.config(bg="green" if now - self.last_can["Inlet NOx"] < STATUS_THRESH else "red")
+        self.outlet_led.config(bg="green" if now - self.last_can["Outlet NOx"] < STATUS_THRESH else "red")
+        self.root.after(500, self.update_can_status)
+
+    # Closing of script
+    def on_close(self):
+        self.stop_event.set()
+        time.sleep(0.1)
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SensorGUI(root)
+    root.mainloop()
+
