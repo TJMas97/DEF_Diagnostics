@@ -1,5 +1,5 @@
 # DEF Diagnostics
-GitHub repository containing the scripts for the diagnostic setup of the DEF Dosing System
+GitHub repository containing the scripts for the diagnostic setup of the DEF Dosing System, as well as the final report that was handed in for the degree of Bachelor of Science in Automotive Engineering
 
 # Python scripts
 In this repository are two Python scripts:
