@@ -1,0 +1,204 @@
+# Thijs Masselink, 1570270
+
+"""
+Manipulation Tool
+
+Provides a Tkinter-based interface to adjust engine parameters via sliders,
+Sends corresponding J1939 CAN messages, and periodically broadcasts fixed NOx values over CAN.
+""" 
+
+# IMPORTS
+import os
+import threading
+import time
+import tkinter as tk
+from tkinter import *
+import serial
+import can
+from PIL import Image, ImageTk
+
+# ICONS
+ASSET_PATH  = "C:/Users/Thijs/Desktop/"
+LOGO_PATH   = os.path.join(ASSET_PATH, "axces.png")
+ICON_PATH   = os.path.join(ASSET_PATH, "axcespictogram.ico")
+
+# SERIAL CONFIGURATION
+SERIAL_PORT = 'COM9'
+BAUDRATE    = 115200
+
+# J1939 CAN CONFIGURATION
+CAN_CHANNEL     = 'PCAN_USBBUS1'
+CAN_BITRATE     = 500000
+PGN_ENGINE_NOX  = 61454  # Inlet NOx
+PGN_TAIL_NOX    = 61455  # Outlet NOx
+
+# EBP CONVERSION PARAMETERS
+EBP_V_MIN  = 0.5
+EBP_V_MAX  = 4.5
+EBP_P_MAX  = 200.0
+EBP_SLOPE  = EBP_P_MAX / (EBP_V_MAX - EBP_V_MIN)
+
+class ManipulationGUI:
+    def __init__(self):
+        self.running = True
+        self.init_nox_values()
+        self.init_defaults_and_latest()
+        self.setup_root()
+        self.init_can_bus()
+        self.init_serial()
+        self.build_gui()
+        threading.Thread(target=self.send_nox_loop, daemon=True).start()
+        self.root.mainloop()
+
+    def init_nox_values(self):
+        # Fixed NOx values in ppm
+        self.inlet_ppm  = 1430.0
+        self.outlet_ppm = 150.0
+
+    def init_defaults_and_latest(self):
+        # Slider default positions
+        self.defaults = {
+            "MIT (°C)": 40,
+            "MAP (kPa)": 150,
+            "RPM": 1500,
+            "Engine Load (%)": 100,
+            "EBP (mbar)": 25
+        }
+        # Latest values for continuous loops
+        self.latest = {
+            'mit':  self.defaults["MIT (°C)"],
+            'map':  self.defaults["MAP (kPa)"],
+            'rpm':  self.defaults["RPM"],
+            'load': self.defaults["Engine Load (%)"]
+        }
+
+    def setup_root(self):
+        self.root = tk.Tk()
+        self.root.title("Axces Emission Technology Manipulation Tool")
+        self.root.geometry("500x700")
+        if os.path.exists(ICON_PATH):
+            self.root.iconbitmap(ICON_PATH)
+
+    def init_can_bus(self):
+        try:
+            self.bus = can.interface.Bus(
+                interface='pcan',
+                channel=CAN_CHANNEL,
+                bitrate=CAN_BITRATE,
+                fd=False
+            )
+        except Exception as e:
+            print(f"CAN bus initialization failed: {e}")
+            self.bus = None
+
+    def init_serial(self):
+        try:
+            self.ser = serial.Serial(
+                port=SERIAL_PORT,
+                baudrate=BAUDRATE
+            )
+        except Exception as e:
+            print(f"Serial init failed: {e}")
+            self.ser = None
+
+    def build_gui(self):
+        self.add_logo()
+        self.add_slider("MIT (°C)", -40, 60, self.update_mit)
+        self.add_slider("MAP (kPa)",   0, 500, self.update_map)
+        self.add_slider("RPM",         0, 8031, self.update_rpm)
+        self.add_slider("Engine Load (%)", 0, 100, self.update_load)
+    
+    def add_logo(self):
+        if os.path.exists(LOGO_PATH):
+            img = Image.open(LOGO_PATH)
+            logo_img = ImageTk.PhotoImage(img)
+            tk.Label(self.root, image=logo_img).pack(pady=10)
+            self.root.logo = logo_img
+
+    def add_slider(self, label, frm, to, command):
+        var = tk.StringVar()
+        slider = Scale(
+            self.root, from_=frm, to=to, orient=HORIZONTAL,
+            label=label, command=lambda v: command(v, var)
+        )
+        slider.pack(fill='x', padx=20, pady=5, expand=True)
+        Label(self.root, textvariable=var).pack()
+
+        default = self.defaults.get(label, (frm + to) / 2)
+        try:
+            slider.set(default)
+            command(default, var)
+        except Exception:
+            mid = (frm + to) / 2
+            slider.set(mid)
+            command(mid, var)
+
+    def send_can_message(self, pgn, data):
+        if not self.bus:
+            return
+        priority = 6
+        can_id   = (priority << 26) | ((pgn & 0x03FFFF) << 8)
+        msg = can.Message(
+            arbitration_id=can_id,
+            data=bytes(data),
+            is_extended_id=True
+        )
+        try:
+            self.bus.send(msg)
+        except can.CanError:
+            print("Failed to send CAN message.")
+
+    # SIGNAL HANDLERS
+    def update_mit(self, val, var):
+        val = int(float(val))
+        self.latest['mit'] = val
+        var.set(f"MIT: {val} °C")
+        data = [0xFF] * 8
+        data[2] = val + 40
+        self.send_can_message(0x00FEF6, data)
+
+    def update_map(self, val, var):
+        val = int(float(val))
+        self.latest['map'] = val
+        var.set(f"MAP: {val} kPa")
+        raw = val // 2
+        data = [raw & 0xFF, (raw >> 8) & 0xFF] + [0xFF] * 6
+        self.send_can_message(0x00FEF6, data)
+
+    def update_rpm(self, val, var):
+        val = int(float(val))
+        self.latest['rpm'] = val
+        var.set(f"Engine Speed: {val} RPM")
+        raw = int(val / 0.125)
+        data = [0xFF] * 3 + [raw & 0xFF, (raw >> 8) & 0xFF] + [0xFF] * 3
+        self.send_can_message(0x00F004, data)
+
+    def update_load(self, val, var):
+        val = int(float(val))
+        self.latest['load'] = val
+        var.set(f"Engine Load: {val} %")
+        raw = int(val * 2.55)
+        data = [0xFF] * 5 + [raw] + [0xFF] * 2
+        self.send_can_message(0x00F003, data)
+
+    # NOX BROADCAST LOOP
+    def send_nox_loop(self):
+        while self.running:
+            raw_in  = int(self.inlet_ppm / 0.05)
+            raw_out = int(self.outlet_ppm / 0.05)
+
+            inlet_low   = raw_in & 0xFF
+            inlet_high  = (raw_in >> 8) & 0xFF
+            outlet_low  = raw_out & 0xFF
+            outlet_high = (raw_out >> 8) & 0xFF
+
+            data_inlet  = [0xFF, inlet_low, inlet_high] + [0xFF] * 5
+            data_outlet = [0xFF, outlet_low, outlet_high] + [0xFF] * 5
+
+            self.send_can_message(PGN_ENGINE_NOX, data_inlet)
+            self.send_can_message(PGN_TAIL_NOX,   data_outlet)
+
+            time.sleep(0.5)
+
+if __name__ == "__main__":
+    ManipulationGUI()
